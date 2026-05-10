@@ -102,10 +102,9 @@ class Logger():
         stats["iteration"] = iteration
         stats["mode"] = self.mode
 
-        row = pd.DataFrame(stats, index=[self.idx])
-
-        self.data = self.data.append(row, sort=False)
-        self.idx +=1
+        for key, value in stats.items():
+            self.data.at[self.idx, key] = value
+        self.idx += 1
 
     def get_data(self):
         return self.data

@@ -1,0 +1,8 @@
+
+PASTIS_DATA/
+
+runs/
+checkpoints/
+__pycache__/
+*.pth
+*.tar

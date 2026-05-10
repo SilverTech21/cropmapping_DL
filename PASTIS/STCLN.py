@@ -7,6 +7,24 @@ import sys
 from torch.nn.modules.transformer import TransformerEncoder, TransformerEncoderLayer
 from torch.nn.modules import LayerNorm
 import math
+import timm
+
+class SpectralAttention(nn.Module):
+    def __init__(self, channels):
+        super(SpectralAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // 16),
+            nn.ReLU(),
+            nn.Linear(channels // 16, channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
 
 class DoubleConv(nn.Module):
     """(convolution => [BN] => ReLU) * 2"""
@@ -24,9 +42,11 @@ class DoubleConv(nn.Module):
             nn.ReLU(inplace=True)
 
         )
+        self.spectral_att = SpectralAttention(out_channels)
 
     def forward(self, x):
-        return self.double_conv(x)
+        x = self.double_conv(x)
+        return self.spectral_att(x)
 
 
 class Down(nn.Module):
@@ -100,19 +120,24 @@ class UTAE(nn.Module):
         self.bilinear = bilinear
         self.encoder_widths = encoder_widths
         self.decoder_widths = decoder_widths
-        self.inc = DoubleConv(n_channels, encoder_widths[0])
-
-        self.down1 = Down(encoder_widths[0], encoder_widths[1])
+        self.spatial_encoder = timm.create_model(
+            'swin_tiny_patch4_window7_224',
+            in_chans=n_channels,
+            features_only=True,
+            pretrained=False,
+            img_size=128,
+        )
+        self.encoder_widths[1] = 96  # Swin stage 0 channels
+        self.h_spatial = 32  # for img_size=128
+        d_model = 96  # match encoder output channels
 
         factor = 2 if bilinear else 1
 
-        self.up3 = Up(decoder_widths[-1]+encoder_widths[-2], decoder_widths[-2] , bilinear)#尝试等于False
-
         self.temporal_encoder = LTAE2d(
-            in_channels=encoder_widths[-1],
+            in_channels=self.encoder_widths[1],
             d_model=d_model,
             n_head=n_head,
-            mlp=[d_model, encoder_widths[-1]],
+            mlp=[d_model, self.encoder_widths[1]],
             return_att=True,
             d_k=d_k,
         )
@@ -126,29 +151,21 @@ class UTAE(nn.Module):
         d_x = x.shape[2]
         h_x = x.shape[-1]
 
-
         x = x.view(-1, *x.shape[-3:])  # bl,d,h,w
 
-        x1 = self.inc(x)
+        features = self.spatial_encoder(x)
+        x2 = features[0].permute(0, 3, 1, 2)  # bl, 96, H_spatial, W_spatial
+        h_spatial = x2.shape[-2]
+        w_spatial = x2.shape[-1]
 
-        x2 = self.down1(x1)  # bl,d,h,w
+        x2 = x2.view(b_x, l_x, -1, h_spatial, w_spatial)  # b l d h w
 
-
-
-
-        obs_embed = x2.view(b_x, l_x, -1, h_x //1, h_x//1)  # bldhw 不下采样
-        obs_embed,attn = self.temporal_encoder(
+        obs_embed = x2
+        obs_embed, attn = self.temporal_encoder(
             obs_embed, batch_positions=batch_positions
-        ) #(bhw)ld
-        # obs_embed = obs_embed.view(b_x,h_x//2,h_x//2,l_x,-1).permute(0,3,4,1,2).contiguous().view(b_x*l_x,-1,h_x//2,h_x//2)
-        obs_embed = obs_embed.view(b_x, h_x, h_x , l_x, -1).permute(0, 3, 4, 1, 2).contiguous().view(b_x * l_x,
-                                                                                                              -1,
-                                                                                                              h_x ,
-                                                                                                              h_x) # bldhw 不下采样
+        )  # returns (b, l, d, h, w)
 
-        obs_embed = obs_embed.view(b_x,l_x, -1, h_x, h_x ).permute(0,3,4,1,2) # bhwld
-
-        return obs_embed,x2
+        return obs_embed, x2
 
 
 
@@ -190,20 +207,22 @@ class UTAEPrediction(nn.Module):
         # mask = mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).repeat(
         #     (1, 1, x.shape[2], x.shape[3], x.shape[4]))  # b l c h w
 
-        mask = torch.ones(x.shape[0],x.shape[1],x.shape[3],x.shape[4]).cuda()
-        mask = F.dropout(mask, self.dropout) * (1 - self.dropout)
-        mask = mask.unsqueeze(2).repeat(
-            (1, 1, x.shape[2], 1, 1))  # b l c h w
+        mask = torch.ones(x.shape[0], x.shape[1], x.shape[3], x.shape[4], device=x.device)
+        mask = F.dropout(mask, self.dropout, training=self.training) * (1 - self.dropout)
+        mask = mask.unsqueeze(2).repeat((1, 1, x.shape[2], 1, 1))  # b l c h w
 
-        clusterLmean = torch.mean(cluster_id_x.float(), dim=[3, 4], keepdim=True).repeat(
-            (1, 1, 1, mask.shape[3], mask.shape[4]))
-        mask[clusterLmean <= 0.9] = 1  # To it smarter?
-        x=x.clone()
+        clusterLmean = torch.mean(cluster_id_x.float(), dim=[3, 4], keepdim=True)
+        mask = mask.masked_fill(clusterLmean <= 0.9, 1)
+
+        x = x.clone()
         x[mask == 0] = self.MASK_TOKEN
 
-        x,x2 = self.utae(x,pos) #bhwld
+        x, x2 = self.utae(x, pos)
 
-        return self.linear(x).permute(0,3,4,1,2),self.midlinear(x2.permute(0,2,3,1)).permute(0,3,1,2).view(x.shape[0],x.shape[3],-1,*x2.shape[-2:]),target,mask #.permute(0,3,4,1,2),
+        out1 = self.linear(x.permute(0, 1, 3, 4, 2)).permute(0, 1, 4, 2, 3)
+        out2 = self.midlinear(x2.permute(0, 1, 3, 4, 2)).permute(0, 1, 4, 2, 3)
+
+        return out1, out2, target, mask
 
 # ----------fine-tune-------------
 class UTAEClassification(nn.Module):
@@ -219,32 +238,29 @@ class UTAEClassification(nn.Module):
 
         super().__init__()
         self.utae = utae
-        self.outlinear = nn.Linear(self.utae.encoder_widths[-1], self.utae.n_classes)#self.utae.decoder_widths[0], self.utae.n_classes 先unet在TE：self.utae.d_model, self.utae.n_classes
-        # self.midlinear = nn.Linear(self.utae.encoder_widths[-1], self.utae.n_classes)#self.utae.decoder_widths[0], self.utae.n_classes 先unet在TE：self.utae.d_model, self.utae.n_classes
-        self.conv1 = nn.Conv2d(self.utae.encoder_widths[-1], self.utae.encoder_widths[-1], (1,1), bias=False)
-        self.conv2 = nn.Conv2d(self.utae.encoder_widths[-1], self.utae.encoder_widths[-1], (1,1),bias=False)
-        self.conv3 = nn.Conv2d(self.utae.encoder_widths[-1], self.utae.encoder_widths[-1], (1, 1), bias=False)
+        self.outlinear = nn.Linear(self.utae.encoder_widths[1], self.utae.n_classes)
+        self.conv1 = nn.Conv2d(self.utae.encoder_widths[1], self.utae.encoder_widths[1], (1,1), bias=False)
+        self.conv2 = nn.Conv2d(self.utae.encoder_widths[1], self.utae.encoder_widths[1], (1,1), bias=False)
+        self.conv3 = nn.Conv2d(self.utae.encoder_widths[1], self.utae.encoder_widths[1], (1, 1), bias=False)
         self.l = nn.Parameter(torch.zeros(1))
         self.dropout = nn.Dropout(0.1)
-    def forward(self, x,pos):
+    def forward(self, x, pos):
+        out, x2 = self.utae(x, pos)  # out: b l d h w, x2: b l d h w
 
-        # # # 尝试用原来的输出
-        out,x2 = self.utae(x, pos) #out:bhwld x2:bl,d,h,w
-        out_1 = self.conv1(out.permute(0,3,4,1,2).view(-1,out.shape[-1],out.shape[1],out.shape[1])).view(out.shape[0],-1,out.shape[1]**2).permute(0,2,1) #b (hw) (ld)
+        out_agg = out.mean(dim=1)  # b d h w
+        x2_agg = x2.mean(dim=1)  # b d h w
 
-        out, _ = torch.max(out, dim=3)
-        x2_2 = self.conv2(x2).view(out.shape[0],-1, x2.shape[-1] ** 2)  # b (ld)(hw)
-        attn = torch.matmul(out_1, x2_2)/np.power(self.utae.encoder_widths[-1], 0.5)  # b hw hw
-        sfm = nn.Softmax(dim=2)
-        attn = sfm(attn)
+        out = self.conv1(out_agg)
+        x2_att = self.conv2(x2_agg)
 
-        out = self.conv3(out.permute(0,3,1,2)).permute(0,2,3,1)
+        attn = torch.sigmoid((out * x2_att).sum(dim=1, keepdim=True))  # b 1 h w
+        out = self.conv3(out) * attn + out
 
-        out = self.l*torch.bmm(attn, out.view(-1, out.shape[1] ** 2, self.utae.encoder_widths[-1]))+out.view(-1, out.shape[1] ** 2, self.utae.encoder_widths[-1]) #b hw d
-        out = self.outlinear(out).permute(0,2,1).view(out.shape[0],-1,x2.shape[-1],x2.shape[-1])
+        out = out.permute(0, 2, 3, 1)  # b h w d
+        out = self.outlinear(out)
+        out = out.permute(0, 3, 1, 2)  # b n_classes h w
 
-
-        return out,x2
+        return out, x2
 
 
 class TemporallySharedBlock(nn.Module):
@@ -609,14 +625,8 @@ class LTAE2d(nn.Module):
             TransformerEncoderLayer(d_model, nhead=8, dim_feedforward=d_model*4, dropout=0.1)
             for _ in range(3)])
 
-        self.in_norm = nn.GroupNorm(
-            num_groups=n_head,
-            num_channels=self.in_channels,
-        )
-        self.out_norm = nn.GroupNorm(
-            num_groups=n_head,
-            num_channels=mlp[-1],
-        )
+        self.in_norm = nn.LayerNorm(self.d_model)
+        self.out_norm = nn.LayerNorm(mlp[-1])
 
         layers = []
         for i in range(len(self.mlp) - 1):
@@ -639,60 +649,25 @@ class LTAE2d(nn.Module):
 
     def forward(self, x, batch_positions=None, pad_mask=None, return_comp=False):
         sz_b, seq_len, d, h, w = x.shape
-
-        if pad_mask is not None:
-            pad_mask = (
-                pad_mask.unsqueeze(-1)
-                .repeat((1, 1, h))
-                .unsqueeze(-1)
-                .repeat((1, 1, 1, w))
-            )  # BxTxHxW
-            pad_mask = (
-                pad_mask.permute(0, 2, 3, 1).contiguous().view(sz_b * h * w, seq_len)
-            )
-
-        out = x.permute(0, 3, 4, 1, 2).contiguous().view(sz_b * h * w, seq_len, d)
-        out = self.in_norm(out.permute(0, 2, 1)).permute(0, 2, 1)
-
-        # if self.inconv is not None:
-        #     out = self.inconv(out.permute(0, 2, 1)).permute(0, 2, 1)   #在UNet里保证下采样最后一层就是transformer的hidden，这里就不进行卷积了
-
-        if self.positional_encoder is not None:
-            bp = (
-                batch_positions.unsqueeze(-1)
-                .repeat((1, 1, h))
-                .unsqueeze(-1)
-                .repeat((1, 1, 1, w))
-            )  # BxTxHxW
-
-            bp = bp.permute(0, 2, 3, 1).contiguous().view(sz_b * h * w, seq_len)
-
-            out = out + self.positional_encoder(bp) # b*h*w,l,d
-
-            # # Yu-Hsiang Huang
-            # batchsize, seq, d = out.shape
-            # src_pos = torch.arange(1, seq + 1, dtype=torch.long).expand(batchsize, seq).to(out.device)
-            # out = out + self.positional_encoder(src_pos)
-
-        # out, attn = self.attention_heads(out,out,out)
-        # out = self.dropout(out)
-
-
-
-        # out = self.transformer_encoder(out.transpose(0,1)).transpose(0,1) # [batch_size, seq_length, embed_size]
+        
+        # Reshape to (batch*h*w, seq_len, d) for transformer
+        # Ensure d is what we expect
+        if d != self.d_model:
+            raise ValueError(f"Input embedding dimension {d} doesn't match d_model {self.d_model}")
+        
+        out = x.permute(0, 3, 4, 1, 2).contiguous()  # (b, h, w, seq_len, d)
+        out = out.reshape(-1, seq_len, d)  # (b*h*w, seq_len, d)
+        
+        # Apply transformer layers
         for enc_layer in self.layer_stack:
             out, attn = enc_layer(out)
-
-        # 用另一个网站的TELayer
-        attn = attn.view( sz_b, h, w, seq_len,seq_len).unsqueeze(0).permute(
-            0, 1, 4,5, 2, 3
-        )  # head x b x t x t x h x w
-
-        # attn = attn.view(self.n_head, sz_b, h, w, seq_len,seq_len).permute(
-        #     0, 1, 4,5, 2, 3
-        # )  # head x b x t x t x h x w
-
-        # attn=out
+        
+        # Reshape back to (batch, seq_len, d, h, w)
+        out = out.reshape(sz_b, h, w, seq_len, d).permute(0, 3, 4, 1, 2).contiguous()
+        
+        # Reshape attention for return
+        attn = attn.reshape(sz_b, h, w, seq_len, seq_len).unsqueeze(0).permute(0, 1, 4, 5, 2, 3)
+        
         if self.return_att:
             return out, attn
         else:
